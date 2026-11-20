@@ -1,7 +1,35 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from utils.model_utils import PatchEmbed
+
+class PatchEmbed(nn.Module):
+    def __init__(
+        self,
+        img_size: int = 32,
+        patch_size: int = 4,
+        in_channels: int = 3,
+        embed_dim: int = 192
+    ):
+        super().__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.grid_size = img_size // patch_size
+        self.num_patches = self.grid_size * self.grid_size
+        self.num_tokens = self.num_patches
+
+        self.proj = nn.Conv2d(
+            in_channels, embed_dim, kernel_size=patch_size, stride=patch_size
+        )
+        self.pos_embed = nn.Parameter(
+            torch.randn(1, self.num_patches, embed_dim) * 0.02
+        )
+        self.norm = nn.LayerNorm(embed_dim, elementwise_affine=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Project (B, C, H, W) -> (B, D, grid, grid) -> (B, num_patches, D)
+        tokens = self.proj(x).flatten(2).transpose(1, 2)
+        tokens = tokens + self.pos_embed
+        return self.norm(tokens)
 
 class FLBViT(nn.Module):
     def __init__(
@@ -264,9 +292,9 @@ class TriadicAttention(nn.Module):
 class JEPAPredictor(nn.Module):
     def __init__(self, embed_dim: int):
         super().__init__()
-        self.psi_x = nn.Linear(embed_dim * 2, embed_dim)
-        self.psi_h = nn.Linear(embed_dim * 3, embed_dim)
-        self.psi_g = nn.Linear(embed_dim * 2, embed_dim)
+        self.psi_x = nn.Linear(2 * embed_dim, embed_dim)
+        self.psi_h = nn.Linear(2 * embed_dim, embed_dim)
+        self.psi_g = nn.Linear(2 * embed_dim, embed_dim)
 
     def cosine_distance(self, target: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
         return 1.0 - F.cosine_similarity(target, pred, dim=-1).mean()
@@ -285,10 +313,10 @@ class JEPAPredictor(nn.Module):
         h_target = lateral_prev.detach()
         g_target = backward_above.detach()
 
-        # Reconstruct each detached incoming stream from its corresponding active subspace
-        pred_x = self.psi_x(torch.cat([forward_new, g_target], dim=-1))
-        pred_h = self.psi_h(torch.cat([lateral_new, x_target, g_target], dim=-1))
-        pred_g = self.psi_g(torch.cat([backward_new, x_target], dim=-1))
+        # Leave-one-out cross-reconstruction: predict each incoming stream from the OTHER two new streams
+        pred_x = self.psi_x(torch.cat([lateral_new, backward_new], dim=-1))
+        pred_h = self.psi_h(torch.cat([forward_new, backward_new], dim=-1))
+        pred_g = self.psi_g(torch.cat([forward_new, lateral_new], dim=-1))
 
         loss_f = self.cosine_distance(x_target, pred_x)
         loss_l = self.cosine_distance(h_target, pred_h)
@@ -304,20 +332,15 @@ class FLBBlock(nn.Module):
         dropout: float = 0.0
     ):
         super().__init__()
-        # Pre-LayerNorms for the three incoming streams
-        self.norm_x = nn.LayerNorm(embed_dim)
-        self.norm_h = nn.LayerNorm(embed_dim)
-        self.norm_g = nn.LayerNorm(embed_dim)
-
-        # Triadic Attention
+        # Triadic Attention (incoming streams are already centered & unit-normed)
         self.attn = TriadicAttention(embed_dim, num_heads, dropout=dropout)
 
-        # Parallel 3-Branch MLP: expands D -> 3D, splits into 3 tracks of D, and projects each D -> D
-        self.norm_mlp = nn.LayerNorm(embed_dim)
+        # Parallel 3-Branch MLP: keep elementwise_affine=True on norm_mlp
+        self.norm_mlp = nn.LayerNorm(embed_dim, elementwise_affine=True)
         self.mlp_in = nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 3),
             nn.GELU(),
-            nn.Dropout(dropout)
+            LockedDropout(dropout)
         )
         self.mlp_out_f = nn.Linear(embed_dim, embed_dim)
         self.mlp_out_h = nn.Linear(embed_dim, embed_dim)
@@ -326,10 +349,14 @@ class FLBBlock(nn.Module):
         self.mlp_drop_h = LockedDropout(dropout)
         self.mlp_drop_g = LockedDropout(dropout)
 
-        # Separate LayerNorms for each decoupled candidate subspace
-        self.norm_cand_f = nn.LayerNorm(embed_dim)
-        self.norm_cand_h = nn.LayerNorm(embed_dim)
-        self.norm_cand_g = nn.LayerNorm(embed_dim)
+        # Parameter-free LayerNorms for candidates and gated outputs (strictly mean 0, var 1)
+        self.norm_cand_f = nn.LayerNorm(embed_dim, elementwise_affine=False)
+        self.norm_cand_h = nn.LayerNorm(embed_dim, elementwise_affine=False)
+        self.norm_cand_g = nn.LayerNorm(embed_dim, elementwise_affine=False)
+
+        self.norm_out_f = nn.LayerNorm(embed_dim, elementwise_affine=False)
+        self.norm_out_h = nn.LayerNorm(embed_dim, elementwise_affine=False)
+        self.norm_out_g = nn.LayerNorm(embed_dim, elementwise_affine=False)
 
         # Parallel Selective Gates for Forward (f), Lateral (z), and Backward (s)
         self.gate_f = nn.Linear(embed_dim * 2, embed_dim)
@@ -345,10 +372,8 @@ class FLBBlock(nn.Module):
         backward_above: torch.Tensor,
         with_aux: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        # Triadic Attention with residual connection
-        attn_out = forward_in + self.attn(
-            self.norm_x(forward_in), self.norm_h(lateral_prev), self.norm_g(backward_above)
-        )
+        # Triadic Attention with residual connection (Signals are pre-normed)
+        attn_out = forward_in + self.attn(forward_in, lateral_prev, backward_above)
 
         # Expand to 3D, split into 3 tracks of size D, and project each independently
         hidden_f, hidden_h, hidden_g = self.mlp_in(self.norm_mlp(attn_out)).chunk(3, dim=-1)
@@ -357,19 +382,19 @@ class FLBBlock(nn.Module):
         raw_h = self.mlp_drop_h(self.mlp_out_h(hidden_h))
         raw_g = self.mlp_drop_g(self.mlp_out_g(hidden_g))
 
-        cand_forward = self.norm_cand_f(attn_out + raw_f)
-        cand_lateral = self.norm_cand_h(attn_out + raw_h)
-        cand_backward = self.norm_cand_g(attn_out + raw_g)
+        cand_forward = self.norm_cand_f(raw_f)
+        cand_lateral = self.norm_cand_h(raw_h)
+        cand_backward = self.norm_cand_g(raw_g)
 
-        # Parallel Gate Updates to route information across the three streams
+        # Parallel Gate Updates followed by Output Standardization
         f_gate = torch.sigmoid(self.gate_f(torch.cat([cand_forward, forward_in], dim=-1)))
-        forward_new = f_gate * forward_in + (1.0 - f_gate) * cand_forward
+        forward_new = self.norm_out_f(f_gate * forward_in + (1.0 - f_gate) * cand_forward)
 
         z_gate = torch.sigmoid(self.gate_z(torch.cat([cand_lateral, lateral_prev], dim=-1)))
-        lateral_new = z_gate * lateral_prev + (1.0 - z_gate) * cand_lateral
+        lateral_new = self.norm_out_h(z_gate * lateral_prev + (1.0 - z_gate) * cand_lateral)
 
         s_gate = torch.sigmoid(self.gate_s(torch.cat([cand_backward, backward_above], dim=-1)))
-        backward_new = s_gate * backward_above + (1.0 - s_gate) * cand_backward
+        backward_new = self.norm_out_g(s_gate * backward_above + (1.0 - s_gate) * cand_backward)
 
         aux_loss = None
         if with_aux:
@@ -407,7 +432,7 @@ class MultiscaleDecoder(nn.Module):
             batch_first=True
         )
         self.attn_drop = LockedDropout(dropout)
-        self.norm_out = nn.LayerNorm(embed_dim)
+        self.norm_out = nn.LayerNorm(embed_dim, elementwise_affine=False)
 
         # Learned attention pooling to collapse N patch tokens into 1 vector for classification
         self.attn_pool = nn.Linear(embed_dim, 1)

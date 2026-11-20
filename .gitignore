@@ -1,4 +1,18 @@
-/data
-/__pycache__/
-/models/__pycache__/
-/utils/__pycache__/
+# Python cache folders and compiled files (matches at any folder depth)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter auto-save folders
+.ipynb_checkpoints/
+
+# Top-level dataset and model checkpoint folders
+/data/
+/checkpoints/
+*.pt
+*.pth
+
+# Local environments and system files
+.venv/
+venv/
+.DS_Store
